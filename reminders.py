@@ -134,12 +134,15 @@ def send_prayer_reminder(context):
     job = context.job
     chat_id = job.context["chat_id"]
     prayer_name = job.context.get("prayer_name")
+    lead_time = job.context.get("lead_time")
 
-    if "lead_time" in job.context and job.context["lead_time"]:
-        # Lead time reminder
-        message = f"Reminder: It's almost {('Shurooq time.' if prayer_name.lower() == 'shurooq' else f'time for {prayer_name.title()} prayer.')} You have {job.context['lead_time']} minutes to prepare."
+    if lead_time:  # Check if lead_time exists
+        message = f"Reminder: It's almost "
+        if prayer_name.lower() == "shurooq":
+            message += f"Shurooq time (in {lead_time} minutes)"  # Include lead time for Shurooq
+        else:
+            message += f"time for {prayer_name.title()} prayer. You have {lead_time} minutes to prepare."
     else:
-        # Exact prayer time reminder
         message = f"It's {('Shurooq time.' if prayer_name.lower() == 'shurooq' else f'time for {prayer_name.title()} prayer.')}"
 
     try:
@@ -292,4 +295,4 @@ def format_time_remaining_natural(days, hours, minutes):
         time_components.append(f"{minutes} minute{'s' if minutes > 1 else ''}")
     if not time_components:
         return "Prayer time is about to start."
-    return f"In {' and '.join(time_components)}."
+    return f"in {' and '.join(time_components)}."
