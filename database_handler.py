@@ -1,68 +1,65 @@
-from config import DATABASE_NAME
+import logging
 import sqlite3
+
+from config import DATABASE_NAME, INACTIVE_LEAD_TIME
+
+logger = logging.getLogger(__name__)
 
 
 def get_db_connection():
-    """Establishes a connection to the SQLite database."""
+    """Opens a connection, creating the table on first use."""
     conn = sqlite3.connect(DATABASE_NAME)
-
-    # Create table if it doesn't exist
     create_user_settings_table(conn)
-
     return conn, conn.cursor()
 
 
 def close_db_connection(conn):
-    """Commits changes and closes the connection to the database."""
+    """Commits and closes."""
     conn.commit()
     conn.close()
 
 
 def create_user_settings_table(conn):
-    """Creates the user_settings table in the database if it doesn't exist."""
+    """Creates the user_settings table if it doesn't exist."""
     c = conn.cursor()
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS user_settings (
+    c.execute("""CREATE TABLE IF NOT EXISTS user_settings (
                 chat_id INTEGER PRIMARY KEY,
                 location TEXT,
                 lead_time INTEGER
-            )"""
-    )
+            )""")
     conn.commit()
 
 
 def save_user_settings(chat_id, location, lead_time):
-    """Saves user settings to the database."""
+    """Inserts or updates one user's settings."""
     conn, c = get_db_connection()
 
     try:
-        # Insert or update user settings based on chat ID
         c.execute(
             """INSERT OR REPLACE INTO user_settings (chat_id, location, lead_time)
                      VALUES (?, ?, ?)""",
             (chat_id, location, lead_time),
         )
-    except sqlite3.Error as e:
-        print(f"Error saving user settings: {e}")
+    except sqlite3.Error:
+        logger.error("Error saving user settings for %s.", chat_id, exc_info=True)
 
     finally:
         close_db_connection(conn)
 
 
 def get_user_settings(chat_id):
-    """Retrieves user settings from the database based on chat ID."""
+    """Returns (location, lead_time) for a chat ID, or None."""
     conn, c = get_db_connection()
 
     try:
-        # Retrieve user settings based on chat ID
         c.execute(
             "SELECT location, lead_time FROM user_settings WHERE chat_id = ?",
             (chat_id,),
         )
         user_settings = c.fetchone()
-    except sqlite3.Error as e:
-        print(f"Error getting user settings: {e}")
-        user_settings = None  # Indicate error by returning None
+    except sqlite3.Error:
+        logger.error("Error getting user settings for %s.", chat_id, exc_info=True)
+        user_settings = None
 
     finally:
         close_db_connection(conn)
@@ -71,15 +68,15 @@ def get_user_settings(chat_id):
 
 
 def get_all_chat_ids():
-    """Retrieves a list of chat IDs from the database."""
+    """Returns every known chat ID, or an empty list on error."""
     conn, c = get_db_connection()
 
     try:
         c.execute("SELECT chat_id FROM user_settings")
         chat_ids = [row[0] for row in c.fetchall()]
-    except sqlite3.Error as e:
-        print(f"Error getting chat_id: {e}")
-        chat_ids = None  # Indicate error by returning None
+    except sqlite3.Error:
+        logger.error("Error getting chat IDs.", exc_info=True)
+        chat_ids = []  # Empty rather than None so callers can iterate safely.
 
     finally:
         close_db_connection(conn)
@@ -88,16 +85,15 @@ def get_all_chat_ids():
 
 
 def deactivate_user(chat_id):
-    """
-    Marks a user as inactive in the database based on chat ID.
-    """
+    """Marks a user inactive after they block the bot."""
     conn, c = get_db_connection()
     try:
-        # Update user status to a flag value indicating inactive
+        # Parameterized, like every other query here — never interpolate.
         c.execute(
-            f"UPDATE user_settings SET lead_time = -1 WHERE chat_id = {chat_id}"
-        )  # Set lead_time to -1
-    except sqlite3.Error as err:
-        print(f"Error deactivating user: {err}")
+            "UPDATE user_settings SET lead_time = ? WHERE chat_id = ?",
+            (INACTIVE_LEAD_TIME, chat_id),
+        )
+    except sqlite3.Error:
+        logger.error("Error deactivating user %s.", chat_id, exc_info=True)
     finally:
         close_db_connection(conn)

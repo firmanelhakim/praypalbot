@@ -1,84 +1,100 @@
 import datetime
+import logging
+import uuid
 from datetime import timedelta
-from dateutil import parser
 
 import pytz
 import telegram
-import uuid
+from dateutil import parser
 
+from config import INACTIVE_LEAD_TIME
 from database_handler import deactivate_user, get_all_chat_ids, get_user_settings
 from prayers import get_prayer_times
+
+logger = logging.getLogger(__name__)
+
+# Guards against startup and the midnight cron both firing within seconds.
+REINIT_MIN_INTERVAL_MINUTES = 60
 
 last_execution_time = None
 
 
+def _localize(naive_datetime, tzinfo):
+    """Attaches a timezone to a naive local datetime, DST-correctly.
+
+    pytz needs localize() rather than replace(tzinfo=...) — the latter attaches
+    the zone's LMT offset (Asia/Kolkata becomes +5:53). Times that are ambiguous
+    or non-existent across a DST boundary resolve to the post-transition offset.
+    """
+    try:
+        return tzinfo.localize(naive_datetime, is_dst=None)
+    except AttributeError:
+        # Fixed-offset tzinfo (not a pytz zone) has no localize().
+        return naive_datetime.replace(tzinfo=tzinfo)
+    except (pytz.AmbiguousTimeError, pytz.NonExistentTimeError):
+        return tzinfo.localize(naive_datetime, is_dst=False)
+
+
 def schedule_prayer_times(chat_id, location, lead_time, job_queue):
-    """Schedules prayer reminders for the entire week, excluding inactive users.
+    """Schedules a week of prayer reminders, skipping inactive users.
 
     Args:
-        chat_id (str): The user's chat ID.
+        chat_id (int): The user's chat ID.
         location (str): The user's location.
-        lead_time (int): The lead time in minutes for reminders (optional).
-        job_queue: The job queue to schedule reminders.
+        lead_time (int or None): Minutes before each prayer to also remind.
+        job_queue: The PTB JobQueue to schedule on.
     """
-
-    if lead_time == -1:  # Check if lead_time is the inactive flag
-        # User has been deactivated, skipping user.
-        print(f"User with ID {chat_id} has been deactivaed. Skipping user.")
+    if lead_time == INACTIVE_LEAD_TIME:
+        logger.info("User with ID %s has been deactivated. Skipping user.", chat_id)
         return
 
     response = get_prayer_times(location)
 
     if isinstance(response, str):
-        print(f"Error getting prayer times for {location}: {response}")
+        logger.error("Error getting prayer times for %r: %s", location, response)
         return
 
-    # Extract prayer times and check for missing data
+    # The IANA name keeps the math DST-aware and correct for half-hour zones
+    # (Asia/Kolkata +5:30). An integer offset truncated these and drifted.
+    timezone_name = response.get("timezone") or "UTC"
     try:
-        timezone_offset = int(response.get("timezone_offset"))
-    except (TypeError, ValueError):
-        print(f"Invalid timezone offset in API response for {location}.")
-        timezone_offset = 0
+        local_timezone = pytz.timezone(timezone_name)
+    except Exception:
+        logger.error(
+            "Unusable timezone %r for %r; falling back to UTC.", timezone_name, location
+        )
+        local_timezone = pytz.utc
 
-    if not timezone_offset:
-        print(f"Timezone offset missing in API response for {location}.")
-        timezone_offset = 0
-
-    offset_timezone = datetime.timezone(datetime.timedelta(hours=timezone_offset))
-    current_time = datetime.datetime.now(offset_timezone)
+    current_time = datetime.datetime.now(pytz.utc)
     delete_existing_reminders(job_queue, chat_id)
 
-    for day_data in response["prayer_times"]:
-        # Extract prayer times for the current day
-        day_prayer_times = day_data
+    for day_prayer_times in response["prayer_times"]:
         prayer_date = day_prayer_times["date_for"]
 
         for prayer_name, prayer_time in day_prayer_times.items():
             if prayer_name == "date_for":
                 continue
 
-            # Construct datetime object for the prayer time
             datetime_str = f"{prayer_date} {prayer_time}"
-            naive_datetime = parser.parse(datetime_str)
-            adjusted_prayer_time = naive_datetime.replace(tzinfo=offset_timezone)
-
-            # Check for past prayer times
-            if adjusted_prayer_time < current_time:
-                print(
-                    f"Prayer time for {prayer_name} on {prayer_date} has already passed. Skipping schedule."
+            try:
+                naive_datetime = parser.parse(datetime_str)
+            except (ValueError, OverflowError):
+                logger.warning(
+                    "Could not parse prayer time %r for %r; skipping.",
+                    datetime_str,
+                    location,
                 )
                 continue
 
-            # Assuming job_queue uses UTC by default
-            adjusted_prayer_time = adjusted_prayer_time.astimezone(pytz.utc)
+            adjusted_prayer_time = _localize(naive_datetime, local_timezone).astimezone(
+                pytz.utc
+            )
 
-            # Base job ID using chat_id, prayer_name, date, timezone offset, and lead time (if set)
-            base_job_id = f"{chat_id}_{prayer_name}_{prayer_date}_{timezone_offset}_{uuid.uuid4()}"
-            if lead_time:
-                base_job_id += f"_{lead_time}"  # Append lead time if present
+            if adjusted_prayer_time < current_time:
+                continue
 
-            # Schedule reminders
-            # - Exact Prayer Time Reminder
+            base_job_id = f"{chat_id}_{prayer_name}_{prayer_date}_{uuid.uuid4()}"
+
             job_queue.run_once(
                 send_prayer_reminder,
                 adjusted_prayer_time,
@@ -86,16 +102,17 @@ def schedule_prayer_times(chat_id, location, lead_time, job_queue):
                     "chat_id": chat_id,
                     "lead_time": None,
                     "prayer_name": prayer_name,
+                    "timezone": timezone_name,
+                    "scheduled_utc": adjusted_prayer_time.isoformat(),
                 },
                 name=f"{base_job_id}_exact",
             )
-            print(
-                f"Scheduled exact prayer reminder for {prayer_name} on {prayer_date} at {adjusted_prayer_time} (Job ID: {base_job_id}_exact)"
-            )
 
-            # - Lead Time Reminder (Optional)
             if lead_time:
                 lead_prayer_time = adjusted_prayer_time - timedelta(minutes=lead_time)
+                # Skip past lead jobs, or they fire the moment they're scheduled.
+                if lead_prayer_time < current_time:
+                    continue
                 job_queue.run_once(
                     send_prayer_reminder,
                     lead_prayer_time,
@@ -103,189 +120,194 @@ def schedule_prayer_times(chat_id, location, lead_time, job_queue):
                         "chat_id": chat_id,
                         "lead_time": lead_time,
                         "prayer_name": prayer_name,
+                        "timezone": timezone_name,
+                        "scheduled_utc": lead_prayer_time.isoformat(),
                     },
                     name=f"{base_job_id}_lead",
                 )
-                print(
-                    f"Scheduled lead time reminder for {prayer_name} on {prayer_date} at {lead_prayer_time} (Job ID: {base_job_id}_lead)"
-                )
+
+    logger.info(
+        "Scheduled reminders for chat %s (%s, %s, lead_time=%s).",
+        chat_id,
+        location,
+        timezone_name,
+        lead_time,
+    )
 
 
 def delete_existing_reminders(job_queue, chat_id):
-    """Deletes existing jobs that start with the given chat ID from the job queue.
-
-    Args:
-        job_queue: The apscheduler job queue to use (potentially unused).
-        chat_id (int): The chat ID to match at the beginning of the job name.
-    """
-    for job in job_queue.scheduler.get_jobs():  # Using scheduler.get_jobs
+    """Removes every scheduled job belonging to the given chat ID."""
+    removed = 0
+    for job in job_queue.scheduler.get_jobs():
         if job.name.startswith(f"{chat_id}_"):
             job.remove()
-            print(f"Deleted existing job: {job.name}")
+            removed += 1
+    if removed:
+        logger.info("Deleted %d existing job(s) for chat %s.", removed, chat_id)
 
 
 def send_prayer_reminder(context):
-    """Sends a prayer reminder message to the user.
-
-    Args:
-        context (JobExecutionContext): The job execution context containing chat ID, prayer name, and optional lead time.
-    """
-
+    """Sends one reminder. The job context carries chat_id, prayer_name, lead_time."""
     job = context.job
     chat_id = job.context["chat_id"]
-    prayer_name = job.context.get("prayer_name")
+    prayer_name = job.context.get("prayer_name") or "prayer"
     lead_time = job.context.get("lead_time")
 
-    if lead_time:  # Check if lead_time exists
-        message = f"Reminder: It's almost "
-        if prayer_name.lower() == "shurooq":
-            message += f"Shurooq time (in {lead_time} minutes)"  # Include lead time for Shurooq
+    is_shurooq = prayer_name.lower() == "shurooq"
+
+    if lead_time:
+        if is_shurooq:
+            message = f"Reminder: It's almost Shurooq time (in {lead_time} minutes)."
         else:
-            message += f"time for {prayer_name.title()} prayer. You have {lead_time} minutes to prepare."
+            message = (
+                f"Reminder: It's almost time for {prayer_name.title()} prayer. "
+                f"You have {lead_time} minutes to prepare."
+            )
     else:
-        message = f"It's {('Shurooq time.' if prayer_name.lower() == 'shurooq' else f'time for {prayer_name.title()} prayer.')}"
+        message = (
+            "It's Shurooq time."
+            if is_shurooq
+            else f"It's time for {prayer_name.title()} prayer."
+        )
 
     try:
         context.bot.send_message(chat_id, text=message)
-    except telegram.error.Unauthorized as e:
-        # User has blocked the bot, deactivate user from database
-        print(f"User with ID {chat_id} has blocked the bot. Deactivating user.")
+    except telegram.error.Unauthorized:
+        # Blocked by the user — stop scheduling for them.
+        logger.info("User with ID %s has blocked the bot. Deactivating user.", chat_id)
         deactivate_user(chat_id)
+    except telegram.error.TelegramError:
+        logger.error("Failed to send reminder to chat %s.", chat_id, exc_info=True)
 
 
 def reinitialize_reminders(updater):
-    """Reinitializes all prayer reminders based on user settings in the database."""
+    """Reschedules every user's reminders from the database.
 
-    current_time = datetime.datetime.now().astimezone(pytz.utc)
-
-    # Print current SGT time
-    print(
-        "Reinitializing reminders at",
-        current_time.astimezone(pytz.timezone("Asia/Singapore")).strftime(
-            "%H:%M:%S %Z"
-        ),
-    )
-
+    Runs on startup and from the midnight-UTC cron. Daily refresh matters
+    because prayer times and DST offsets both change, and the prayers.py cache
+    only holds for 24h.
+    """
     global last_execution_time
 
-    if last_execution_time is None or (current_time - last_execution_time) >= timedelta(
-        days=3
-    ):
-        # First execution or at least 3 days since last execution
-        last_execution_time = current_time  # Update last execution time
-    else:
-        print("Skipping reinitialization (less than 3 days since last execution).")
+    current_time = datetime.datetime.now(pytz.utc)
+
+    if last_execution_time is not None and (
+        current_time - last_execution_time
+    ) < timedelta(minutes=REINIT_MIN_INTERVAL_MINUTES):
+        logger.info("Skipping reinitialization (ran less than an hour ago).")
         return
 
-    # Get all chat IDs
+    last_execution_time = current_time
+    logger.info("Reinitializing reminders at %s.", current_time.isoformat())
+
     chat_ids = get_all_chat_ids()
+    if not chat_ids:
+        logger.info("No users to reinitialize.")
+        return
 
+    scheduled = 0
     for chat_id in chat_ids:
-        print(f"Processing chat ID: {chat_id}")  # Print chat ID being processed
-
         user_settings = get_user_settings(chat_id)
 
         if not user_settings:
-            print(
-                f"Skipping chat ID {chat_id}: No user settings found"
-            )  # Print reason for skipping
+            logger.warning("Skipping chat ID %s: no user settings found.", chat_id)
             continue
 
         location, lead_time = user_settings
-        schedule_prayer_times(
-            chat_id, location, lead_time, updater.dispatcher.job_queue
-        )
+        if not location:
+            logger.info("Skipping chat ID %s: no location set.", chat_id)
+            continue
 
-    print("Reminder reinitialization complete!")  # Print completion message
+        try:
+            schedule_prayer_times(
+                chat_id, location, lead_time, updater.dispatcher.job_queue
+            )
+            scheduled += 1
+        except Exception:
+            # One bad user must not abort the refresh for everyone else.
+            logger.error(
+                "Failed to reinitialize reminders for chat %s.", chat_id, exc_info=True
+            )
+
+    logger.info("Reminder reinitialization complete (%d user(s)).", scheduled)
+
+
+def _job_context(aps_job):
+    """Returns the PTB job context dict behind an APScheduler job, or None.
+
+    PTB stores a CallbackContext in the APScheduler job's `args`, with the
+    reminder payload on `job.context`. Reading it beats parsing the job *name*,
+    which broke whenever the name format changed.
+    """
+    for arg in getattr(aps_job, "args", ()) or ():
+        job = getattr(arg, "job", None) or (arg if hasattr(arg, "context") else None)
+        context = getattr(job, "context", None)
+        if isinstance(context, dict):
+            return context
+    return None
 
 
 def get_upcoming_reminder(chat_id, job_queue):
-    """
-    This function retrieves information about the upcoming scheduled prayer reminder
-    for the given chat ID, considering both exact and lead time reminders.
+    """Returns the user's next pending reminder, or None.
 
-    Args:
-        chat_id (int): The chat ID of the user.
-        job_queue (apscheduler.schedulers.base.BaseScheduler):
-            The APScheduler job queue to use.
+    Considers both exact and lead-time jobs.
 
     Returns:
-        dict or None:
-            A dictionary containing details about the upcoming reminder
-            (prayer_name, scheduled_time, lead_time_minutes, timezone_offset)
-            if found, otherwise None.
+        dict with prayer_name, scheduled_time, time_remaining and lead_time.
     """
-    upcoming_job = None
-
     matching_jobs = [
         job
         for job in job_queue.scheduler.get_jobs()
-        if job.name.startswith(f"{chat_id}_") and job.name.endswith("_exact")
+        if job.name.startswith(f"{chat_id}_") and job.next_run_time is not None
     ]
 
-    if matching_jobs:
-        # Find job with earliest next_run_time using a custom key function
-        upcoming_job = min(matching_jobs, key=lambda job: job.next_run_time)
-    else:
-        upcoming_job = None
-
-    # Now upcoming_job holds the job with the earliest next_run_time
-
-    if upcoming_job:
-        # Extract information from job name
-        job_name_parts = upcoming_job.name.split("_")
-
-        # Check for minimum expected parts (including potential lead time)
-        if len(job_name_parts) < 6:
-            return None  # Invalid format
-
-        prayer_name = job_name_parts[1]  # Assuming prayer name is the second part
-        timezone_offset = None  # Initialize timezone_offset
-
-        # Extract timezone offset
-        if len(job_name_parts) > 3:
-            try:
-                # Attempt to convert the part before potential lead time (assuming timezone offset)
-                timezone_offset = int(job_name_parts[3])
-            except ValueError:
-                # If conversion fails, ignore and keep timezone_offset as None
-                pass
-
-        # Construct scheduled time with timezone offset (if available)
-        offset_timezone = (
-            pytz.utc
-            if timezone_offset is None
-            else datetime.timezone(datetime.timedelta(hours=timezone_offset))
-        )
-
-        scheduled_time = upcoming_job.next_run_time.astimezone(offset_timezone)
-        scheduled_time_str = scheduled_time.strftime("%H:%M:%S %Z (%a)")
-
-        # Calculate time difference
-        now = datetime.datetime.now(offset_timezone)
-        time_remaining = scheduled_time - now
-
-        # Format time remaining (considering negative values for past prayers)
-        if time_remaining < timedelta(seconds=0):  # Prayer time has already passed
-            time_remaining_str = "Prayer time has already passed."
-        else:
-            days = time_remaining.days
-            hours = time_remaining.seconds // 3600 % 24
-            minutes = time_remaining.seconds // 60 % 60
-            time_remaining_str = format_time_remaining_natural(days, hours, minutes)
-
-        return {
-            "prayer_name": prayer_name,
-            "scheduled_time": scheduled_time_str,
-            "time_remaining": time_remaining_str,
-        }
-
-    else:
+    if not matching_jobs:
         return None
 
+    upcoming_job = min(matching_jobs, key=lambda job: job.next_run_time)
 
-# Function to format time remaining in a more natural language way (optional)
+    # Prefer the structured context; the job name is only a fallback for the
+    # prayer name, which has always been its second underscore-field.
+    context = _job_context(upcoming_job) or {}
+    prayer_name = context.get("prayer_name")
+    lead_time = context.get("lead_time")
+    timezone_name = context.get("timezone")
+
+    if not prayer_name:
+        name_parts = upcoming_job.name.split("_")
+        if len(name_parts) < 2:
+            return None
+        prayer_name = name_parts[1]
+
+    # Show the time in the user's own timezone when known.
+    try:
+        display_timezone = pytz.timezone(timezone_name) if timezone_name else pytz.utc
+    except Exception:
+        display_timezone = pytz.utc
+
+    scheduled_time = upcoming_job.next_run_time.astimezone(display_timezone)
+    scheduled_time_str = scheduled_time.strftime("%H:%M:%S %Z (%a)")
+
+    time_remaining = scheduled_time - datetime.datetime.now(pytz.utc)
+
+    if time_remaining < timedelta(seconds=0):
+        time_remaining_str = "Prayer time has already passed."
+    else:
+        days = time_remaining.days
+        hours = time_remaining.seconds // 3600 % 24
+        minutes = time_remaining.seconds // 60 % 60
+        time_remaining_str = format_time_remaining_natural(days, hours, minutes)
+
+    return {
+        "prayer_name": prayer_name,
+        "scheduled_time": scheduled_time_str,
+        "time_remaining": time_remaining_str,
+        "lead_time": lead_time,
+    }
+
+
 def format_time_remaining_natural(days, hours, minutes):
+    """Renders a countdown as "in 2 hours and 5 minutes"."""
     time_components = []
     if days > 0:
         time_components.append(f"{days} day{'s' if days > 1 else ''}")

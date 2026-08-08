@@ -1,44 +1,49 @@
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.application import MIMEApplication
+import logging
 import os
+import smtplib
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 from credentials import SENDER_EMAIL, SENDER_PASSWORD, RECIPIENTS
 
+logger = logging.getLogger(__name__)
+
 
 def send_email(subject, message, file_path=None):
-    """
-    Sends an email using Gmail's SMTP server with secure connection (TLS) and an optional attachment.
+    """Sends an alert email over Gmail SMTP with TLS.
 
     Args:
-        subject (str): The subject line of the email.
-        message (str): The body of the email message.
-        file_path (str, optional): The path to the file you want to attach. Defaults to None.
+        subject (str): Subject line.
+        message (str): Body text.
+        file_path (str, optional): File to attach.
 
     Returns:
-        bool: True if the email is sent successfully, False otherwise.
+        bool: True if sent, False otherwise.
     """
+    # Alerting is optional — a missing mail config must never take the bot down.
+    if not (SENDER_EMAIL and SENDER_PASSWORD and RECIPIENTS):
+        logger.warning(
+            "Email not configured (SENDER_EMAIL/SENDER_PASSWORD/RECIPIENTS); "
+            "skipping alert: %s",
+            subject,
+        )
+        return False
 
+    recipients = [addr.strip() for addr in RECIPIENTS.split(",") if addr.strip()]
+
+    server = None
     try:
-        # Use Gmail's SMTP server with TLS encryption
-        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=30)
         server.starttls()
-
-        # Login with sender credentials (consider using app passwords)
         server.login(SENDER_EMAIL, SENDER_PASSWORD)
 
-        # Create a multipart message for text and attachment (if provided)
         msg = MIMEMultipart()
         msg["From"] = SENDER_EMAIL
-        msg["To"] = RECIPIENTS
+        msg["To"] = ", ".join(recipients)
         msg["Subject"] = subject
+        msg.attach(MIMEText(message, "plain"))
 
-        # Attach the text message
-        text_part = MIMEText(message, "plain")
-        msg.attach(text_part)
-
-        # Attach the file (if a valid path is provided)
         if file_path and os.path.isfile(file_path):
             with open(file_path, "rb") as f:
                 file_part = MIMEApplication(f.read(), "octet-stream")
@@ -48,14 +53,17 @@ def send_email(subject, message, file_path=None):
                 )
                 msg.attach(file_part)
 
-        # Send the email
-        server.sendmail(SENDER_EMAIL, RECIPIENTS, msg.as_string())
-
-        # Close the connection
-        server.quit()
-
+        server.sendmail(SENDER_EMAIL, recipients, msg.as_string())
         return True
 
-    except Exception as e:
-        print(f"Error sending email: {e}")
+    except Exception:
+        logger.error("Error sending email alert %r", subject, exc_info=True)
         return False
+
+    finally:
+        # quit() here so a failure mid-send can't leak the socket.
+        if server is not None:
+            try:
+                server.quit()
+            except Exception:
+                pass

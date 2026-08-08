@@ -1,5 +1,8 @@
-#!/usr/bin/python3.9
+#!/usr/bin/env python3
 
+import logging
+
+import telegram
 from apscheduler.schedulers.background import BackgroundScheduler
 from telegram.ext import (
     Updater,
@@ -8,12 +11,8 @@ from telegram.ext import (
     Filters,
     MessageHandler,
 )
-import pytz
-import telegram
-import time
 
-from utils import logging
-
+import utils  # noqa: F401  — imported for its logging/cache setup side effects
 from command_handler import (
     SET_LOCATION,
     SET_LEAD_TIME,
@@ -28,54 +27,49 @@ from credentials import TELEGRAM_BOT_TOKEN
 from reminders import reinitialize_reminders
 from send_email import send_email
 
+logger = logging.getLogger(__name__)
 
-def start_scheduler(scheduler, logger):
+
+def start_scheduler(scheduler):
     """Starts the scheduler and logs the event."""
     try:
         scheduler.start()
         logger.info("Scheduler started successfully.")
-    except Exception as e:
-        logger.error(f"Error starting scheduler: {e}")
+    except Exception:
+        logger.error("Error starting scheduler.", exc_info=True)
 
 
 def get_active_jobs(scheduler):
-    """Prints information about currently active jobs in the scheduler, showing next run time in Singapore Time (SGT)."""
-    print("Active Jobs:")
-    for job in scheduler.get_jobs():
-        # Extract job name and next run time
-        job_name = job.name
-        next_run_time = job.next_run_time.astimezone(pytz.timezone("Asia/Singapore"))
-        next_run_time_str = next_run_time.strftime("%Y-%m-%d %H:%M:%S (SGT)")
-        # Format the message and print directly
-        message = f"- Name: {job_name}, Next Run (SGT): {next_run_time_str}"
-        print(message)
+    """Logs information about currently active jobs in the scheduler."""
+    jobs = scheduler.get_jobs()
+    logger.info("Active jobs: %d", len(jobs))
 
 
 def handle_telegram_error(update, context):
-    # Handle all Telegram errors
-    error = context.error
-    print(f"An error occurred: {error}")
+    """Handles every error raised while processing an update.
 
-
-def handle_read_timeout_error(update, context, updater):
+    Must take exactly (update, context). PTB's second positional argument to
+    add_error_handler is `run_async`, not user data — passing anything truthy
+    there makes PTB call this with two arguments and raise TypeError.
+    """
     error = context.error
-    if isinstance(error, telegram.error.TimedOut):
-        print(f"Read timeout error occurred during update retrieval. Reconnecting...")
-        # Implement reconnection logic
-        updater.stop()
-        time.sleep(5)  # Wait for some time before restarting
-        updater.start_polling()
+
+    # Network blips are self-healing; Updater retries polling on its own.
+    if isinstance(error, (telegram.error.TimedOut, telegram.error.NetworkError)):
+        logger.warning("Transient Telegram network error: %s", error)
+        return
+
+    logger.error("Unhandled error while processing update.", exc_info=error)
 
 
 def main():
     updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
-    # Register error handlers
+    # No extra arguments here — see handle_telegram_error's docstring.
     dp.add_error_handler(handle_telegram_error)
-    dp.add_error_handler(handle_read_timeout_error, updater)
 
-    scheduler = BackgroundScheduler()
+    scheduler = BackgroundScheduler(timezone="UTC")
 
     scheduler.add_job(
         lambda: reinitialize_reminders(updater),
@@ -89,17 +83,15 @@ def main():
     scheduler.add_job(
         get_active_jobs,
         "cron",
-        args=(scheduler,),  # Pass scheduler as argument
-        hour="*",  # Run every hour
+        args=(scheduler,),
+        hour="*",
         day_of_week="*",
         timezone="UTC",
     )
-    start_scheduler(scheduler, logging.getLogger(__name__))
+    start_scheduler(scheduler)
 
-    # Re-initialize reminders on startup
     reinitialize_reminders(updater)
 
-    # Set up conversation handler with the states
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -121,22 +113,19 @@ def main():
     dp.add_handler(CommandHandler("todayprayertimes", today_prayer_times))
 
     try:
+        logger.info("Starting polling.")
         updater.start_polling()
         updater.idle()
-    except telegram.error.NetworkError as e:
-        print(f"Network error: {e}")
-        # Send email notification for network error
-        send_email(
-            "PrayPalBot Network Error",
-            f"Network error encountered: {e}",
-        )
     except Exception as e:
-        logging.error(f"An error occurred: {e}")
-        # Send email notification for general exception
-        send_email(
-            "PrayPalBot Error",
-            f"An error occurred: {e}",
-        )
+        logger.critical("Bot stopped by an unhandled exception.", exc_info=True)
+        send_email("PrayPalBot Error", f"An error occurred: {e}")
+        raise
+    finally:
+        # Stop the scheduler so a restart can't leave an orphaned thread.
+        try:
+            scheduler.shutdown(wait=False)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
