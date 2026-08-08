@@ -1,7 +1,36 @@
-APScheduler==3.6.3
-cachetools==4.2.2
+# Direct dependencies only. Transitive packages (certifi, tornado, urllib3, ...)
+# are left to pip.
+#
+#   python3 -m venv env && source env/bin/activate && pip install -r requirements.txt
+#
+# WARNING: never `pip install telegram`. That unrelated package squats the same
+# import name and shadows python-telegram-bot. Remove it if `pip list` shows it.
+#
+# NOTE: PTB 13's metadata declares APScheduler==3.6.3 and cachetools==4.2.2, so
+# `pip check` reports a conflict against the versions below. The pins are
+# over-tight, not real: PTB only uses BackgroundScheduler and cachetools.LRUCache,
+# both API-stable. Verified working — see the "dependency upgrade" note in the
+# README. Install those two with --no-deps to keep pip from downgrading them.
+
+# main.py, command_handler.py — Updater/ConversationHandler (v13 sync API).
+# Held at 13.x deliberately: v20+ is async-only and would require rewriting
+# every handler. 13.15 is the last v13 release.
+python-telegram-bot==13.15
+
+# reminders.py, main.py — BackgroundScheduler.
+# 3.6.3 raises "Only timezones from the pytz library are supported" on any job
+# added to a default-timezone scheduler when tzlocal>=3 is installed.
+APScheduler==3.11.3
+
+# utils.py — TTLCache.
+cachetools==7.1.7
+
+# prayers.py, reminders.py — timezone arithmetic. Ships the IANA database, so
+# keep it current or DST rules go stale.
+pytz==2026.3.post1
+
+# reminders.py — dateutil.parser.
 python-dateutil==2.9.0.post0
-python-telegram-bot==13.7
-pytz==2024.1
-requests==2.27.1
-telegram==0.0.1
+
+# prayers.py — HTTP calls to the AlAdhan API.
+requests==2.34.2
